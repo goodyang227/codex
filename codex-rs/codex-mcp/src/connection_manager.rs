@@ -47,6 +47,7 @@ use crate::runtime::McpRuntimeInput;
 use crate::runtime::McpStartupPolicy;
 use crate::server::McpServerConnectionIdentity;
 use crate::server::McpServerMetadata;
+use crate::server::McpServerOrigin;
 use crate::tool_catalog_cache::McpToolCatalogCacheContext;
 use crate::tools::ToolFilter;
 use crate::tools::ToolInfo;
@@ -751,6 +752,60 @@ impl McpConnectionSet {
 
     pub fn has_servers(&self) -> bool {
         !self.servers.is_empty()
+    }
+
+    /// Returns an equivalent connection set without stdio-backed servers.
+    ///
+    /// HTTP connections are retained so background authentication and recovery
+    /// state survives while an idle thread releases its child processes.
+    pub(crate) async fn without_stdio_servers(&self) -> Option<Self> {
+        let servers = self
+            .servers
+            .iter()
+            .filter(|(_, view)| {
+                !matches!(view.metadata.origin.as_ref(), Some(McpServerOrigin::Stdio))
+            })
+            .map(|(name, view)| (name.clone(), view.clone()))
+            .collect::<HashMap<_, _>>();
+        if servers.len() == self.servers.len() {
+            return None;
+        }
+
+        let optional_startup_deadline = OnceLock::new();
+        if let Some(deadline) = self.optional_startup_deadline.get() {
+            let _ = optional_startup_deadline.set(*deadline);
+        }
+        Some(Self {
+            required_servers: self
+                .required_servers
+                .iter()
+                .filter(|name| servers.contains_key(*name))
+                .cloned()
+                .collect(),
+            servers,
+            disabled_servers: self.disabled_servers.clone(),
+            protocol_mode: self.protocol_mode,
+            optional_startup_deadline,
+            tool_catalog_revision: Arc::clone(&self.tool_catalog_revision),
+            codex_apps_tools_override: RwLock::new(
+                self.codex_apps_tools_override.read().await.clone(),
+            ),
+            codex_apps_refresh_lock: Mutex::new(()),
+            tool_plugin_provenance: Arc::clone(&self.tool_plugin_provenance),
+            prefix_mcp_tool_names: self.prefix_mcp_tool_names,
+            non_prefixed_mcp_tool_servers: self.non_prefixed_mcp_tool_servers.clone(),
+            elicitation_requests: self.elicitation_requests.clone(),
+        })
+    }
+
+    pub(crate) async fn wait_for_stdio_startup(&self) {
+        for view in self
+            .servers
+            .values()
+            .filter(|view| matches!(view.metadata.origin.as_ref(), Some(McpServerOrigin::Stdio)))
+        {
+            let _ = view.connection.client().await;
+        }
     }
 
     pub(crate) fn contains_server(&self, server_name: &str) -> bool {

@@ -65,6 +65,12 @@ impl Session {
                 })
                 .await;
         }
+
+        // A retained Desktop thread should not retain one process per configured stdio
+        // MCP server while it is idle. Serialize retirement with refresh and recheck the
+        // active turn after lifecycle contributors, because they may have yielded long
+        // enough for a new turn to start.
+        self.suspend_mcp_runtime_if_idle().await;
     }
 
     pub(super) async fn emit_turn_abort_lifecycle(

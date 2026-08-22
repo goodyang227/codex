@@ -10,7 +10,6 @@ use codex_core::StartThreadOptions;
 use codex_core::TurnInputRequest;
 use codex_exec_server::ExecutorFileSystem;
 use codex_exec_server::RemoveOptions;
-use codex_protocol::mcp::McpServerConnectionStatus;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::EventMsg;
@@ -242,7 +241,11 @@ async fn mcp_calls_stay_bound_to_each_thread() -> anyhow::Result<()> {
     }
 
     assert_ne!(processes[0], processes[1]);
-    assert_eq!(processes[0], processes[2]);
+    assert_ne!(
+        processes[0], processes[2],
+        "a later turn should restart its thread's retired stdio MCP process"
+    );
+    assert_ne!(processes[1], processes[2]);
 
     fixture.codex.shutdown_and_wait().await?;
     second_thread.shutdown_and_wait().await?;
@@ -554,7 +557,8 @@ async fn cached_mcp_startup_is_eager_for_root_and_lazy_for_subagents() -> anyhow
             .mcp_connection_statuses(&mcp_config)
             .await
             .get(SERVER_NAME),
-        Some(&McpServerConnectionStatus::NotStarted),
+        None,
+        "idle threads should retire even dormant stdio MCP connections",
     );
     assert_eq!(
         fs.read_file_text(&pid_file, Default::default(), /*sandbox*/ None)
