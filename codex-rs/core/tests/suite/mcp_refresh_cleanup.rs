@@ -8,6 +8,7 @@ use codex_config::DEFAULT_MCP_SERVER_ENVIRONMENT_ID;
 use codex_config::types::McpServerConfig;
 use codex_config::types::McpServerTransportConfig;
 use codex_core::TurnInputRequest;
+use codex_features::Feature;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::Op;
 use codex_protocol::user_input::UserInput;
@@ -204,7 +205,7 @@ async fn optional_stdio_restart_does_not_block_the_next_turn_past_startup_grace(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn failed_required_stdio_restart_stops_the_next_turn_before_model_request()
+async fn failed_required_stdio_restart_stops_pre_sampling_compact_and_model_request()
 -> anyhow::Result<()> {
     skip_if_no_network!(Ok(()));
 
@@ -218,6 +219,9 @@ async fn failed_required_stdio_restart_stops_the_next_turn_before_model_request(
     let command = stdio_server_bin()?;
     let fixture = test_codex()
         .with_config(move |config| {
+            config.compact_prompt = Some("test compact prompt".to_string());
+            config.model_auto_compact_token_limit = Some(100);
+            let _ = config.features.disable(Feature::RemoteCompactionV2);
             let mut servers = config.mcp_servers.get().clone();
             servers.insert(
                 "required_cleanup".to_string(),
@@ -270,7 +274,7 @@ async fn failed_required_stdio_restart_stops_the_next_turn_before_model_request(
         responses::sse(vec![
             responses::ev_response_created("resp-1"),
             responses::ev_assistant_message("msg-1", "done"),
-            responses::ev_completed("resp-1"),
+            responses::ev_completed_with_tokens("resp-1", 1_000),
         ]),
     )
     .await;
@@ -309,7 +313,7 @@ async fn failed_required_stdio_restart_stops_the_next_turn_before_model_request(
     assert_eq!(
         server.received_requests().await.unwrap_or_default().len(),
         1,
-        "a failed required MCP restart must stop the next turn before model sampling",
+        "a failed required MCP restart must stop the next turn before pre-sampling compaction or model sampling",
     );
 
     let second_pid = wait_for_pid_file(&pid_file).await?;

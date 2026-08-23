@@ -162,6 +162,20 @@ pub(crate) async fn run_turn(
 
     let mut client_session =
         prewarmed_client_session.unwrap_or_else(|| sess.services.model_client.new_session());
+    let user_input = turn_user_input(&input);
+    let (required_servers, mentioned_plugins) =
+        match required_mcp_servers_for_input(&sess, turn_context.as_ref(), &user_input)
+            .or_cancel(&cancellation_token)
+            .await
+        {
+            Ok(Ok(requirements)) => requirements,
+            Ok(Err(err)) => return Err(err),
+            Err(err) => {
+                run_hooks_and_record_inputs(&sess, &turn_context, &input, PersistContext::Standard)
+                    .await;
+                return Err(err.into());
+            }
+        };
     // TODO(ccunningham): Pre-turn compaction runs before context updates and the
     // new user message are recorded. Estimate pending incoming items (context
     // diffs/full reinjection + user input) and trigger compaction preemptively
@@ -188,21 +202,6 @@ pub(crate) async fn run_turn(
         error!("Failed to run pre-sampling compact");
         return Ok(None);
     }
-
-    let user_input = turn_user_input(&input);
-    let (required_servers, mentioned_plugins) =
-        match required_mcp_servers_for_input(&sess, turn_context.as_ref(), &user_input)
-            .or_cancel(&cancellation_token)
-            .await
-        {
-            Ok(Ok(requirements)) => requirements,
-            Ok(Err(err)) => return Err(err),
-            Err(err) => {
-                run_hooks_and_record_inputs(&sess, &turn_context, &input, PersistContext::Standard)
-                    .await;
-                return Err(err.into());
-            }
-        };
 
     // run_turn owns the step used to seed context and make the first sampling request.
     let first_step_context = match sess
