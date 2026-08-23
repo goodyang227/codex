@@ -315,9 +315,9 @@ impl McpRuntime {
     /// Once the last binding to the retired connection set is dropped, its transports
     /// and any owned stdio server processes are terminated. Callers must arrange for a
     /// later refresh before the runtime is used again.
-    pub async fn suspend_stdio_servers(&self) -> bool {
+    pub fn suspend_stdio_servers(&self) -> bool {
         let current = self.current.load_full();
-        let Some(connections) = current.connections.without_stdio_servers().await else {
+        let Some(connections) = current.connections.without_stdio_servers() else {
             return false;
         };
         self.current.store(Arc::new(PublishedMcpRuntime {
@@ -342,7 +342,7 @@ impl McpRuntime {
             self.current
                 .load_full()
                 .connections
-                .wait_for_stdio_startup()
+                .wait_for_stdio_startup_with_optional_grace()
                 .await;
         }
         self.stdio_restart_pending.store(false, Ordering::Release);

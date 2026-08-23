@@ -324,7 +324,7 @@ impl Session {
         if self.active_turn.lock().await.is_some() {
             return;
         }
-        if self.services.mcp_runtime.suspend_stdio_servers().await {
+        if self.services.mcp_runtime.suspend_stdio_servers() {
             self.mark_mcp_runtime_dirty();
         }
     }

@@ -186,8 +186,8 @@ pub(crate) struct McpConnectionSet {
     required_servers: Vec<String>,
     optional_startup_deadline: OnceLock<tokio::time::Instant>,
     tool_catalog_revision: Arc<RwLock<u64>>,
-    codex_apps_tools_override: RwLock<Option<Vec<ToolInfo>>>,
-    codex_apps_refresh_lock: Mutex<()>,
+    codex_apps_tools_override: Arc<RwLock<Option<Vec<ToolInfo>>>>,
+    codex_apps_refresh_lock: Arc<Mutex<()>>,
     tool_plugin_provenance: Arc<ToolPluginProvenance>,
     prefix_mcp_tool_names: bool,
     non_prefixed_mcp_tool_servers: Vec<String>,
@@ -675,8 +675,8 @@ impl McpConnectionSet {
             required_servers,
             optional_startup_deadline: OnceLock::new(),
             tool_catalog_revision: Arc::new(RwLock::new(0)),
-            codex_apps_tools_override: RwLock::new(None),
-            codex_apps_refresh_lock: Mutex::new(()),
+            codex_apps_tools_override: Arc::new(RwLock::new(None)),
+            codex_apps_refresh_lock: Arc::new(Mutex::new(())),
             tool_plugin_provenance,
             prefix_mcp_tool_names,
             non_prefixed_mcp_tool_servers,
@@ -735,8 +735,8 @@ impl McpConnectionSet {
             required_servers: Vec::new(),
             optional_startup_deadline: OnceLock::new(),
             tool_catalog_revision: Arc::new(RwLock::new(0)),
-            codex_apps_tools_override: RwLock::new(None),
-            codex_apps_refresh_lock: Mutex::new(()),
+            codex_apps_tools_override: Arc::new(RwLock::new(None)),
+            codex_apps_refresh_lock: Arc::new(Mutex::new(())),
             tool_plugin_provenance: Arc::new(ToolPluginProvenance::default()),
             prefix_mcp_tool_names,
             non_prefixed_mcp_tool_servers: Vec::new(),
@@ -758,7 +758,7 @@ impl McpConnectionSet {
     ///
     /// HTTP connections are retained so background authentication and recovery
     /// state survives while an idle thread releases its child processes.
-    pub(crate) async fn without_stdio_servers(&self) -> Option<Self> {
+    pub(crate) fn without_stdio_servers(&self) -> Option<Self> {
         let servers = self
             .servers
             .iter()
@@ -787,10 +787,8 @@ impl McpConnectionSet {
             protocol_mode: self.protocol_mode,
             optional_startup_deadline,
             tool_catalog_revision: Arc::clone(&self.tool_catalog_revision),
-            codex_apps_tools_override: RwLock::new(
-                self.codex_apps_tools_override.read().await.clone(),
-            ),
-            codex_apps_refresh_lock: Mutex::new(()),
+            codex_apps_tools_override: Arc::clone(&self.codex_apps_tools_override),
+            codex_apps_refresh_lock: Arc::clone(&self.codex_apps_refresh_lock),
             tool_plugin_provenance: Arc::clone(&self.tool_plugin_provenance),
             prefix_mcp_tool_names: self.prefix_mcp_tool_names,
             non_prefixed_mcp_tool_servers: self.non_prefixed_mcp_tool_servers.clone(),
@@ -798,14 +796,41 @@ impl McpConnectionSet {
         })
     }
 
-    pub(crate) async fn wait_for_stdio_startup(&self) {
-        for view in self
-            .servers
-            .values()
-            .filter(|view| matches!(view.metadata.origin.as_ref(), Some(McpServerOrigin::Stdio)))
-        {
-            let _ = view.connection.client().await;
-        }
+    pub(crate) async fn wait_for_stdio_startup_with_optional_grace(&self) {
+        let optional_startup_deadline = *self
+            .optional_startup_deadline
+            .get_or_init(|| tokio::time::Instant::now() + tool_catalog::OPTIONAL_MCP_STARTUP_GRACE);
+        futures::future::join_all(
+            self.servers
+                .iter()
+                .filter(|&(_server_name, view)| {
+                    matches!(view.metadata.origin.as_ref(), Some(McpServerOrigin::Stdio))
+                })
+                .map(|(server_name, view)| async move {
+                    if view
+                        .connection
+                        .client
+                        .startup_complete
+                        .load(Ordering::Acquire)
+                    {
+                        return;
+                    }
+                    if self.required_servers.binary_search(server_name).is_ok() {
+                        let _ = view.connection.client().await;
+                    } else {
+                        let startup_deadline = view
+                            .connection
+                            .client
+                            .tool_catalog_cache_context
+                            .as_ref()
+                            .map(|cache| cache.optional_startup_deadline(optional_startup_deadline))
+                            .unwrap_or(optional_startup_deadline);
+                        let _ = tokio::time::timeout_at(startup_deadline, view.connection.client())
+                            .await;
+                    }
+                }),
+        )
+        .await;
     }
 
     pub(crate) fn contains_server(&self, server_name: &str) -> bool {

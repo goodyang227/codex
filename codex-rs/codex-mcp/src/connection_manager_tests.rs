@@ -97,8 +97,8 @@ impl McpConnectionSet {
             required_servers: Vec::new(),
             optional_startup_deadline: OnceLock::new(),
             tool_catalog_revision: Arc::new(RwLock::new(0)),
-            codex_apps_tools_override: RwLock::new(None),
-            codex_apps_refresh_lock: Mutex::new(()),
+            codex_apps_tools_override: Arc::new(RwLock::new(None)),
+            codex_apps_refresh_lock: Arc::new(Mutex::new(())),
             tool_plugin_provenance: Arc::new(ToolPluginProvenance::default()),
             prefix_mcp_tool_names,
             non_prefixed_mcp_tool_servers: Vec::new(),
@@ -440,6 +440,94 @@ async fn create_ready_async_managed_client(tools: Vec<ToolInfo>) -> AsyncManaged
         startup_reconnect: None,
         cancel_token: CancellationToken::new(),
     }
+}
+
+#[tokio::test]
+#[expect(
+    clippy::await_holding_invalid_type,
+    reason = "the test must hold one catalog lock while proving the filtered set shares it"
+)]
+async fn removing_stdio_servers_keeps_one_synchronized_http_catalog_state() {
+    let approval_policy = Constrained::allow_any(AskForApproval::OnRequest);
+    let permission_profile = Constrained::allow_any(PermissionProfile::default());
+    let mut manager = McpConnectionSet::new_uninitialized(
+        &approval_policy,
+        &permission_profile,
+        /*prefix_mcp_tool_names*/ true,
+    );
+    for server_name in [CODEX_APPS_MCP_SERVER_NAME, "local"] {
+        manager.insert_test_client(
+            server_name,
+            create_ready_async_managed_client(Vec::new()).await,
+        );
+    }
+    let metadata = McpServerMetadata {
+        environment_id: codex_config::DEFAULT_MCP_SERVER_ENVIRONMENT_ID.to_string(),
+        pollutes_memory: false,
+        origin: Some(McpServerOrigin::StreamableHttp(
+            "https://example.test".to_string(),
+        )),
+        supports_parallel_tool_calls: false,
+        default_tools_approval_mode: None,
+        tool_approval_modes: HashMap::new(),
+    };
+    manager.set_test_server_metadata(CODEX_APPS_MCP_SERVER_NAME, metadata.clone());
+    manager.set_test_server_metadata(
+        "local",
+        McpServerMetadata {
+            origin: Some(McpServerOrigin::Stdio),
+            ..metadata
+        },
+    );
+
+    let filtered = manager
+        .without_stdio_servers()
+        .expect("the stdio server should be removed");
+    assert!(filtered.servers.contains_key(CODEX_APPS_MCP_SERVER_NAME));
+    assert!(!filtered.servers.contains_key("local"));
+    assert!(Arc::ptr_eq(
+        &manager.tool_catalog_revision,
+        &filtered.tool_catalog_revision,
+    ));
+    assert!(Arc::ptr_eq(
+        &manager.codex_apps_tools_override,
+        &filtered.codex_apps_tools_override,
+    ));
+    assert!(Arc::ptr_eq(
+        &manager.codex_apps_refresh_lock,
+        &filtered.codex_apps_refresh_lock,
+    ));
+
+    let refresh = manager.codex_apps_refresh_lock.lock().await;
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(1),
+            filtered.codex_apps_refresh_lock.lock(),
+        )
+        .await
+        .is_err(),
+        "the filtered set must serialize with an in-flight HTTP catalog refresh",
+    );
+    drop(refresh);
+
+    let updated_tools = vec![create_test_tool(CODEX_APPS_MCP_SERVER_NAME, "updated")];
+    *manager.codex_apps_tools_override.write().await = Some(updated_tools.clone());
+    *manager.tool_catalog_revision.write().await += 1;
+    assert_eq!(
+        filtered
+            .codex_apps_tools_override
+            .read()
+            .await
+            .as_ref()
+            .map(|tools| {
+                tools
+                    .iter()
+                    .map(|tool| tool.callable_name.as_str())
+                    .collect::<Vec<_>>()
+            }),
+        Some(vec!["updated"]),
+    );
+    assert_eq!(*filtered.tool_catalog_revision.read().await, 1);
 }
 
 #[tokio::test]

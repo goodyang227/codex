@@ -32,7 +32,7 @@ use crate::tools::normalize_tools_for_model_with_prefix;
 const MCP_UI_META_KEY: &str = "ui";
 const MCP_UI_VISIBILITY_META_KEY: &str = "visibility";
 const MCP_UI_MODEL_VISIBILITY: &str = "model";
-const OPTIONAL_MCP_STARTUP_GRACE: Duration = Duration::from_secs(1);
+pub(super) const OPTIONAL_MCP_STARTUP_GRACE: Duration = Duration::from_secs(1);
 
 /// Returns whether a tool may be included in model-facing tool declarations.
 ///
