@@ -195,7 +195,8 @@ pub(crate) async fn run_turn(
             .or_cancel(&cancellation_token)
             .await
         {
-            Ok(requirements) => requirements,
+            Ok(Ok(requirements)) => requirements,
+            Ok(Err(err)) => return Err(err),
             Err(err) => {
                 run_hooks_and_record_inputs(&sess, &turn_context, &input, PersistContext::Standard)
                     .await;
@@ -345,7 +346,7 @@ pub(crate) async fn run_turn(
                     &pending_user_input,
                 )
                 .or_cancel(&cancellation_token)
-                .await?;
+                .await??;
                 sess.capture_step_context_with_required_mcp_servers(
                     Arc::clone(&turn_context),
                     &cancellation_token,
@@ -658,14 +659,19 @@ async fn required_mcp_servers_for_input(
     sess: &Arc<Session>,
     turn_context: &TurnContext,
     user_input: &[UserInput],
-) -> (Vec<String>, Vec<crate::plugins::PluginCapabilitySummary>) {
+) -> CodexResult<(Vec<String>, Vec<crate::plugins::PluginCapabilitySummary>)> {
     if crate::guardian::is_guardian_reviewer_source(&turn_context.session_source) {
-        return (Vec::new(), Vec::new());
+        return Ok((Vec::new(), Vec::new()));
     }
 
     // Plugin capabilities depend on authentication, so project them only after
     // the runtime has aligned the plugin manager with its current account.
     sess.refresh_mcp_if_dirty().await;
+    sess.services
+        .mcp_runtime
+        .validate_required_servers()
+        .await
+        .map_err(|error| CodexErr::Fatal(error.to_string()))?;
     let loaded_plugins = sess
         .services
         .plugins_manager
@@ -751,7 +757,7 @@ async fn required_mcp_servers_for_input(
         }
     }
 
-    (required_servers.into_iter().collect(), mentioned_plugins)
+    Ok((required_servers.into_iter().collect(), mentioned_plugins))
 }
 
 #[instrument(level = "trace", skip_all)]
