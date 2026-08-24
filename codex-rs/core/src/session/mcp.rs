@@ -231,6 +231,13 @@ impl Session {
                 Some(self.mcp_elicitation_reviewer()),
             )
             .await;
+            self.services
+                .mcp_runtime
+                .complete_stdio_restart(!matches!(
+                    desired.session_source,
+                    SessionSource::SubAgent(_)
+                ))
+                .await;
             refresh_invalidation.published = true;
             if !self.mcp_refresh.is_pending() {
                 return;
@@ -304,6 +311,22 @@ impl Session {
 
     pub(super) fn mark_mcp_runtime_dirty(&self) {
         self.mcp_refresh.invalidate();
+    }
+
+    /// Retires the current MCP runtime if this thread is still idle.
+    ///
+    /// Holding the refresh gate across the idle check and runtime retirement
+    /// prevents a newly reserved turn from using the retired runtime.
+    pub(crate) async fn suspend_mcp_runtime_if_idle(&self) {
+        let Ok(_refresh) = self.mcp_refresh.acquire().await else {
+            return;
+        };
+        if self.active_turn.lock().await.is_some() {
+            return;
+        }
+        if self.services.mcp_runtime.suspend_stdio_servers() {
+            self.mark_mcp_runtime_dirty();
+        }
     }
 
     #[tracing::instrument(name = "mcp.runtime.resolve_for_step", skip_all)]

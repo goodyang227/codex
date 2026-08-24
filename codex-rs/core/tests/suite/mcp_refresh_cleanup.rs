@@ -3,10 +3,15 @@ use std::fs;
 use std::sync::Arc;
 use std::time::Duration;
 
+use anyhow::Context;
 use codex_config::DEFAULT_MCP_SERVER_ENVIRONMENT_ID;
 use codex_config::types::McpServerConfig;
 use codex_config::types::McpServerTransportConfig;
+use codex_core::TurnInputRequest;
+use codex_features::Feature;
+use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::Op;
+use codex_protocol::user_input::UserInput;
 use core_test_support::process::process_is_alive;
 use core_test_support::process::wait_for_pid_file;
 use core_test_support::process::wait_for_process_exit;
@@ -14,7 +19,307 @@ use core_test_support::responses;
 use core_test_support::skip_if_no_network;
 use core_test_support::stdio_server_bin;
 use core_test_support::test_codex::test_codex;
+use core_test_support::wait_for_event;
 use core_test_support::wait_for_mcp_server;
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn completed_turn_stops_idle_stdio_mcp_and_next_turn_restarts_it() -> anyhow::Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = responses::start_mock_server().await;
+    let temp_dir = tempfile::tempdir()?;
+    let pid_file = temp_dir.path().join("mcp.pid");
+    let pid_file_for_config = pid_file.clone();
+    let command = stdio_server_bin()?;
+    let fixture = test_codex()
+        .with_config(move |config| {
+            let mut servers = config.mcp_servers.get().clone();
+            servers.insert(
+                "idle_cleanup".to_string(),
+                McpServerConfig {
+                    auth: Default::default(),
+                    transport: McpServerTransportConfig::Stdio {
+                        command,
+                        args: Vec::new(),
+                        env: Some(HashMap::from([(
+                            "MCP_TEST_PID_FILE".to_string(),
+                            pid_file_for_config.to_string_lossy().into_owned(),
+                        )])),
+                        env_vars: Vec::new(),
+                        cwd: None,
+                    },
+                    environment_id: DEFAULT_MCP_SERVER_ENVIRONMENT_ID.to_string(),
+                    enabled: true,
+                    required: false,
+                    supports_parallel_tool_calls: false,
+                    omit_tools_from: None,
+                    disabled_reason: None,
+                    startup_timeout_sec: Some(Duration::from_secs(10)),
+                    tool_timeout_sec: None,
+                    default_tools_approval_mode: None,
+                    enabled_tools: None,
+                    disabled_tools: None,
+                    scopes: None,
+                    oauth: None,
+                    oauth_resource: None,
+                    tools: HashMap::new(),
+                },
+            );
+            config
+                .mcp_servers
+                .set(servers)
+                .expect("test MCP servers should accept any configuration");
+        })
+        .build(&server)
+        .await?;
+    wait_for_mcp_server(&fixture.codex, "idle_cleanup").await?;
+
+    let first_pid = wait_for_pid_file(&pid_file).await?;
+    assert!(process_is_alive(&first_pid)?);
+    responses::mount_sse_once(
+        &server,
+        responses::sse(vec![
+            responses::ev_response_created("resp-1"),
+            responses::ev_assistant_message("msg-1", "done"),
+            responses::ev_completed("resp-1"),
+        ]),
+    )
+    .await;
+    fixture.submit_turn("finish the first turn").await?;
+
+    wait_for_process_exit(&first_pid).await?;
+
+    fs::remove_file(&pid_file)?;
+    responses::mount_sse_once(
+        &server,
+        responses::sse(vec![
+            responses::ev_response_created("resp-2"),
+            responses::ev_assistant_message("msg-2", "done again"),
+            responses::ev_completed("resp-2"),
+        ]),
+    )
+    .await;
+    fixture.submit_turn("start a second turn").await?;
+
+    let second_pid = wait_for_pid_file(&pid_file).await?;
+    assert_ne!(second_pid, first_pid);
+    wait_for_process_exit(&second_pid).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn optional_stdio_restart_does_not_block_the_next_turn_past_startup_grace()
+-> anyhow::Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = responses::start_mock_server().await;
+    let temp_dir = tempfile::tempdir()?;
+    let pid_file = temp_dir.path().join("mcp.pid");
+    let barrier_file = temp_dir.path().join("initialize-ready");
+    fs::write(&barrier_file, "ready")?;
+    let pid_file_for_config = pid_file.clone();
+    let barrier_file_for_config = barrier_file.clone();
+    let command = stdio_server_bin()?;
+    let fixture = test_codex()
+        .with_config(move |config| {
+            let mut servers = config.mcp_servers.get().clone();
+            servers.insert(
+                "idle_cleanup".to_string(),
+                McpServerConfig {
+                    auth: Default::default(),
+                    transport: McpServerTransportConfig::Stdio {
+                        command,
+                        args: Vec::new(),
+                        env: Some(HashMap::from([
+                            (
+                                "MCP_TEST_PID_FILE".to_string(),
+                                pid_file_for_config.to_string_lossy().into_owned(),
+                            ),
+                            (
+                                "MCP_TEST_INITIALIZE_BARRIER_FILE".to_string(),
+                                barrier_file_for_config.to_string_lossy().into_owned(),
+                            ),
+                        ])),
+                        env_vars: Vec::new(),
+                        cwd: None,
+                    },
+                    environment_id: DEFAULT_MCP_SERVER_ENVIRONMENT_ID.to_string(),
+                    enabled: true,
+                    required: false,
+                    supports_parallel_tool_calls: false,
+                    omit_tools_from: None,
+                    disabled_reason: None,
+                    startup_timeout_sec: Some(Duration::from_secs(10)),
+                    tool_timeout_sec: None,
+                    default_tools_approval_mode: None,
+                    enabled_tools: None,
+                    disabled_tools: None,
+                    scopes: None,
+                    oauth: None,
+                    oauth_resource: None,
+                    tools: HashMap::new(),
+                },
+            );
+            config
+                .mcp_servers
+                .set(servers)
+                .expect("test MCP servers should accept any configuration");
+        })
+        .build(&server)
+        .await?;
+    wait_for_mcp_server(&fixture.codex, "idle_cleanup").await?;
+
+    responses::mount_sse_once(
+        &server,
+        responses::sse(vec![
+            responses::ev_response_created("resp-1"),
+            responses::ev_assistant_message("msg-1", "done"),
+            responses::ev_completed("resp-1"),
+        ]),
+    )
+    .await;
+    fixture.submit_turn("finish the first turn").await?;
+    let first_pid = wait_for_pid_file(&pid_file).await?;
+    wait_for_process_exit(&first_pid).await?;
+
+    fs::remove_file(&pid_file)?;
+    fs::remove_file(&barrier_file)?;
+    responses::mount_sse_once(
+        &server,
+        responses::sse(vec![
+            responses::ev_response_created("resp-2"),
+            responses::ev_assistant_message("msg-2", "done again"),
+            responses::ev_completed("resp-2"),
+        ]),
+    )
+    .await;
+    tokio::time::timeout(
+        Duration::from_millis(3_000),
+        fixture.submit_turn("start a second turn without waiting for the optional MCP"),
+    )
+    .await
+    .context("an optional stdio restart exceeded its startup grace")??;
+
+    let second_pid = wait_for_pid_file(&pid_file).await?;
+    assert_ne!(second_pid, first_pid);
+    wait_for_process_exit(&second_pid).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn failed_required_stdio_restart_stops_pre_sampling_compact_and_model_request()
+-> anyhow::Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = responses::start_mock_server().await;
+    let temp_dir = tempfile::tempdir()?;
+    let pid_file = temp_dir.path().join("mcp.pid");
+    let barrier_file = temp_dir.path().join("initialize-ready");
+    fs::write(&barrier_file, "ready")?;
+    let pid_file_for_config = pid_file.clone();
+    let barrier_file_for_config = barrier_file.clone();
+    let command = stdio_server_bin()?;
+    let fixture = test_codex()
+        .with_config(move |config| {
+            config.compact_prompt = Some("test compact prompt".to_string());
+            config.model_auto_compact_token_limit = Some(100);
+            let _ = config.features.disable(Feature::RemoteCompactionV2);
+            let mut servers = config.mcp_servers.get().clone();
+            servers.insert(
+                "required_cleanup".to_string(),
+                McpServerConfig {
+                    auth: Default::default(),
+                    transport: McpServerTransportConfig::Stdio {
+                        command,
+                        args: Vec::new(),
+                        env: Some(HashMap::from([
+                            (
+                                "MCP_TEST_PID_FILE".to_string(),
+                                pid_file_for_config.to_string_lossy().into_owned(),
+                            ),
+                            (
+                                "MCP_TEST_INITIALIZE_BARRIER_FILE".to_string(),
+                                barrier_file_for_config.to_string_lossy().into_owned(),
+                            ),
+                        ])),
+                        env_vars: Vec::new(),
+                        cwd: None,
+                    },
+                    environment_id: DEFAULT_MCP_SERVER_ENVIRONMENT_ID.to_string(),
+                    enabled: true,
+                    required: true,
+                    supports_parallel_tool_calls: false,
+                    omit_tools_from: None,
+                    disabled_reason: None,
+                    startup_timeout_sec: Some(Duration::from_secs(1)),
+                    tool_timeout_sec: None,
+                    default_tools_approval_mode: None,
+                    enabled_tools: None,
+                    disabled_tools: None,
+                    scopes: None,
+                    oauth: None,
+                    oauth_resource: None,
+                    tools: HashMap::new(),
+                },
+            );
+            config
+                .mcp_servers
+                .set(servers)
+                .expect("test MCP servers should accept any configuration");
+        })
+        .build(&server)
+        .await?;
+    wait_for_mcp_server(&fixture.codex, "required_cleanup").await?;
+
+    responses::mount_sse_once(
+        &server,
+        responses::sse(vec![
+            responses::ev_response_created("resp-1"),
+            responses::ev_assistant_message("msg-1", "done"),
+            responses::ev_completed_with_tokens("resp-1", 1_000),
+        ]),
+    )
+    .await;
+    fixture.submit_turn("finish the first turn").await?;
+    let first_pid = wait_for_pid_file(&pid_file).await?;
+    wait_for_process_exit(&first_pid).await?;
+
+    fs::remove_file(&pid_file)?;
+    fs::remove_file(&barrier_file)?;
+    fixture
+        .codex
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "start a second turn".to_string(),
+            text_elements: Vec::new(),
+        }]))
+        .await?;
+    let event = tokio::time::timeout(Duration::from_secs(3), async {
+        wait_for_event(&fixture.codex, |event| matches!(event, EventMsg::Error(_))).await
+    })
+    .await
+    .context("required MCP restart failure was not reported")?;
+    let EventMsg::Error(error) = event else {
+        unreachable!("event predicate requires an error event");
+    };
+    assert!(
+        error
+            .message
+            .contains("required MCP servers failed to initialize"),
+        "unexpected required MCP error: {}",
+        error.message,
+    );
+    wait_for_event(&fixture.codex, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+    assert_eq!(
+        server.received_requests().await.unwrap_or_default().len(),
+        1,
+        "a failed required MCP restart must stop the next turn before pre-sampling compaction or model sampling",
+    );
+
+    let second_pid = wait_for_pid_file(&pid_file).await?;
+    assert_ne!(second_pid, first_pid);
+    wait_for_process_exit(&second_pid).await
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn refresh_keeps_superseded_mcp_server_alive_for_in_flight_calls() -> anyhow::Result<()> {
@@ -127,8 +432,7 @@ async fn refresh_keeps_superseded_mcp_server_alive_for_in_flight_calls() -> anyh
             .is_cancelled()
     );
     wait_for_process_exit(&superseded_pid).await?;
-    assert!(process_is_alive(&replacement_pid)?);
-
-    fixture.codex.shutdown_and_wait().await?;
+    // The replacement served the completed turn, so thread-idle retirement
+    // should release it without waiting for the whole thread to shut down.
     wait_for_process_exit(&replacement_pid).await
 }

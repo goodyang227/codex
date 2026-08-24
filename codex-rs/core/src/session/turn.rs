@@ -162,6 +162,20 @@ pub(crate) async fn run_turn(
 
     let mut client_session =
         prewarmed_client_session.unwrap_or_else(|| sess.services.model_client.new_session());
+    let user_input = turn_user_input(&input);
+    let (required_servers, mentioned_plugins) =
+        match required_mcp_servers_for_input(&sess, turn_context.as_ref(), &user_input)
+            .or_cancel(&cancellation_token)
+            .await
+        {
+            Ok(Ok(requirements)) => requirements,
+            Ok(Err(err)) => return Err(err),
+            Err(err) => {
+                run_hooks_and_record_inputs(&sess, &turn_context, &input, PersistContext::Standard)
+                    .await;
+                return Err(err.into());
+            }
+        };
     // TODO(ccunningham): Pre-turn compaction runs before context updates and the
     // new user message are recorded. Estimate pending incoming items (context
     // diffs/full reinjection + user input) and trigger compaction preemptively
@@ -188,20 +202,6 @@ pub(crate) async fn run_turn(
         error!("Failed to run pre-sampling compact");
         return Ok(None);
     }
-
-    let user_input = turn_user_input(&input);
-    let (required_servers, mentioned_plugins) =
-        match required_mcp_servers_for_input(&sess, turn_context.as_ref(), &user_input)
-            .or_cancel(&cancellation_token)
-            .await
-        {
-            Ok(requirements) => requirements,
-            Err(err) => {
-                run_hooks_and_record_inputs(&sess, &turn_context, &input, PersistContext::Standard)
-                    .await;
-                return Err(err.into());
-            }
-        };
 
     // run_turn owns the step used to seed context and make the first sampling request.
     let first_step_context = match sess
@@ -345,7 +345,7 @@ pub(crate) async fn run_turn(
                     &pending_user_input,
                 )
                 .or_cancel(&cancellation_token)
-                .await?;
+                .await??;
                 sess.capture_step_context_with_required_mcp_servers(
                     Arc::clone(&turn_context),
                     &cancellation_token,
@@ -658,14 +658,19 @@ async fn required_mcp_servers_for_input(
     sess: &Arc<Session>,
     turn_context: &TurnContext,
     user_input: &[UserInput],
-) -> (Vec<String>, Vec<crate::plugins::PluginCapabilitySummary>) {
+) -> CodexResult<(Vec<String>, Vec<crate::plugins::PluginCapabilitySummary>)> {
     if crate::guardian::is_guardian_reviewer_source(&turn_context.session_source) {
-        return (Vec::new(), Vec::new());
+        return Ok((Vec::new(), Vec::new()));
     }
 
     // Plugin capabilities depend on authentication, so project them only after
     // the runtime has aligned the plugin manager with its current account.
     sess.refresh_mcp_if_dirty().await;
+    sess.services
+        .mcp_runtime
+        .validate_required_servers()
+        .await
+        .map_err(|error| CodexErr::Fatal(error.to_string()))?;
     let loaded_plugins = sess
         .services
         .plugins_manager
@@ -751,7 +756,7 @@ async fn required_mcp_servers_for_input(
         }
     }
 
-    (required_servers.into_iter().collect(), mentioned_plugins)
+    Ok((required_servers.into_iter().collect(), mentioned_plugins))
 }
 
 #[instrument(level = "trace", skip_all)]

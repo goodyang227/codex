@@ -93,6 +93,7 @@ pub struct McpRuntime {
     current: ArcSwap<PublishedMcpRuntime>,
     hosted_event_server_removals: watch::Sender<()>,
     reconnect_pending: AtomicBool,
+    stdio_restart_pending: AtomicBool,
     elicitation_router: ElicitationRequestRouter,
     resource_origins: Mutex<ResourceOrigins>,
 }
@@ -178,6 +179,7 @@ impl McpRuntime {
             }),
             hosted_event_server_removals: watch::channel(()).0,
             reconnect_pending: AtomicBool::new(false),
+            stdio_restart_pending: AtomicBool::new(false),
             elicitation_router: ElicitationRequestRouter::default(),
             resource_origins: Mutex::default(),
         }
@@ -306,6 +308,44 @@ impl McpRuntime {
     /// Ensures the next refresh creates fresh connections for every configured server.
     pub fn reconnect_on_next_refresh(&self) {
         self.reconnect_pending.store(true, Ordering::Release);
+    }
+
+    /// Removes stdio servers while preserving HTTP connections and bindings held by active calls.
+    ///
+    /// Once the last binding to the retired connection set is dropped, its transports
+    /// and any owned stdio server processes are terminated. Callers must arrange for a
+    /// later refresh before the runtime is used again.
+    pub fn suspend_stdio_servers(&self) -> bool {
+        let current = self.current.load_full();
+        let Some(connections) = current.connections.without_stdio_servers() else {
+            return false;
+        };
+        self.current.store(Arc::new(PublishedMcpRuntime {
+            connections: Arc::new(connections),
+            config: current.config.clone(),
+            auth: current.auth.clone(),
+            auth_token: current.auth_token.clone(),
+            plugins_available: current.plugins_available,
+            ready_selected_capability_roots: current.ready_selected_capability_roots.clone(),
+            cached_binding: Mutex::new(None),
+        }));
+        self.stdio_restart_pending.store(true, Ordering::Release);
+        true
+    }
+
+    /// Finishes an idle stdio restart before a root thread captures model-visible tools.
+    pub async fn complete_stdio_restart(&self, wait_for_startup: bool) {
+        if !self.stdio_restart_pending.load(Ordering::Acquire) {
+            return;
+        }
+        if wait_for_startup {
+            self.current
+                .load_full()
+                .connections
+                .wait_for_stdio_startup_with_optional_grace()
+                .await;
+        }
+        self.stdio_restart_pending.store(false, Ordering::Release);
     }
 
     /// Captures the latest published configuration and live client handles.
